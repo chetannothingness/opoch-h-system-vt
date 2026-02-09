@@ -66,7 +66,7 @@ Contract choice: We promise **UNIQUE-PLAN** in the demo, not just UNIQUE-COST.
 - Span-of-control parameter `η` so leaders required:
 
 ```
-L_t ≥ η · Σ_k n_{t,k}
+L_t ≥ ⌈η · Σ_k n_{t,k}⌉
 ```
 
 ### 1.3 Decision variables
@@ -310,6 +310,11 @@ Then the bucket requirement is:
 
 **Implementation note:** `N_req` is computed once and hashed; the model and parameters are pinned in the contract so the curve is not arbitrary. Reproducibility is guaranteed by the hash.
 
+**Grid specification:** For each type `k`, `N_req(λ; k)` is tabulated over:
+- Range: `λ ∈ [0, λ^{max}_k]` where `λ^{max}_k = H^{cap}_k · μ_k · ρ^{max}` (maximum rate the full headcount can serve at target utilization `ρ^{max} < 1`, e.g., 0.95).
+- Step size: `Δλ_k` chosen so that `N_req` changes by at most 1 between adjacent grid points (guaranteed by monotonicity; start with `Δλ_k = μ_k / 2` and halve if needed).
+- Interpolation: for any `λ` between grid points, use `N_req(λ; k) := N_req(⌈λ / Δλ_k⌉ · Δλ_k; k)` (round up to next grid point — conservative, never understaffs).
+
 ### 3.2 IT (idle time) from utilization
 
 Expected busy hours in bucket:
@@ -361,8 +366,10 @@ n_{t,k} ≥ N_req(λ_{t,k}^{rob}; k)    ∀ t, k
 
 **Leaders:**
 ```
-L_t ≥ η · Σ_k n_{t,k}
+L_t ≥ ⌈η · Σ_k n_{t,k}⌉
 ```
+
+**One shift per operator per day:** Each operator is assigned at most one shift template per planning day. This makes `Σ_s y_{s,k}` equal to the number of distinct type-k operators rostered, so the headcount cap `H^{cap}_k` bounds the number of people, not shifts.
 
 **Caps:**
 ```
@@ -400,40 +407,35 @@ Any skill eligibility constraints apply as further linear restrictions.
 
 The roster is built to satisfy `N_req` via shift staffing alone, without pre-planned overtime. Overtime arises only in real-time recourse (Section 5) when realized demand deviates from forecast.
 
-**Stages 2–6 (canonical tie-break chain for UNIQUE-PLAN):**
+**Stages 2–5 (canonical tie-break chain for UNIQUE-PLAN):**
 
-After finding minimal cost `C*`, let `F(C*)` be the feasible set with cost fixed: `C(y,o,L) = C*`.
+After finding minimal cost `C*`, let `F(C*)` be the feasible set with cost fixed at `C*` and `o_{t,k} = 0`.
 
 Solve successive refinement problems in order:
 
-1. **Min idle hours** (computed under the same demand contract):
+1. **Min idle hours** (design choice: idle is computed under the same robust demand `λ^{rob}` used in planning, not realized demand — this makes the tie-break deterministic at plan time):
 ```
 J_1 = Σ_{t,k} ( n_{t,k} · Δ - (λ_{t,k}^{rob} · Δ) / μ_k )
 ```
 
-2. **Min overtime hours:**
+2. **Min total headcount-shift count:**
 ```
-J_2 = Σ_{t,k} o_{t,k} · Δ
-```
-
-3. **Min total headcount-shift count:**
-```
-J_3 = Σ_{s,k} y_{s,k}
+J_2 = Σ_{s,k} y_{s,k}
 ```
 
-4. **Min leader-hours:**
+3. **Min leader-hours:**
 ```
-J_4 = Σ_t L_t · Δ
+J_3 = Σ_t L_t · Δ
 ```
 
-5. **Canonical lexicographic hash order** over the integer vector `(y, o, L)` (smallest lexicographic ordering of a fixed serialization of variables).
+4. **Canonical lexicographic hash order** over the integer vector `(y, L)` (smallest lexicographic ordering of a fixed serialization of variables).
 
 The canonical plan is:
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  (y*, o*, L*) = argmin_{(y,o,L) ∈ F(C*)}  (J_1, J_2, J_3, J_4, lex-hash) │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  (y*, L*) = argmin_{(y,L) ∈ F(C*)}  (J_1, J_2, J_3, lex-hash)      │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 This is fully pinned: there is exactly one output plan. Demo output label is **UNIQUE-PLAN** (with `C*` and tie-break receipts).
@@ -463,7 +465,11 @@ At runtime, observe `A_{t,k}`. Maintain backlog `Q_{t,k}` and choose overtime `o
 
 Use the same compiled requirement:
 
-- Compute a short-horizon realized rate `λ̂_{t,k}` from arrivals/backlog.
+- Compute the realized rate:
+```
+λ̂_{t,k} = (A_{t,k} + Q_{t,k}) / Δ
+```
+where `A_{t,k}` is new arrivals and `Q_{t,k}` is carry-over backlog from the previous bucket.
 - Compute `N_req(λ̂_{t,k}; k)`.
 - Enforce `n_{t,k} ≥ N_req` by adding overtime minimally.
 
@@ -531,7 +537,7 @@ For any given instance (store/day), output only:
 ### UNIQUE-PLAN (only when MILP optimality gap ≤ tolerance)
 - Canonical schedule `y*_{s,k}`, leaders `L*_t`.
 - Total cost `C*`.
-- Tie-break receipts: values of `(J_1, J_2, J_3, J_4)` from the canonical chain (Section 4.4).
+- Tie-break receipts: values of `(J_1, J_2, J_3)` from the canonical chain (Section 4.4).
 - Computed RT/IT per bucket.
 - Optimality proof: best incumbent = best bound (gap ≤ tolerance).
 - Replay receipts.
@@ -558,7 +564,10 @@ D(U, K') = Σ_{t∈U} Σ_{k∈K'} N_req(λ_{t,k}^{rob}; k) · Δ
 ```
 
 ```
-S(U, K') = maximum schedulable staffing-hours in the window given caps and templates
+S(U, K') = optimum of a max-coverage MILP restricted to window U and types K':
+            max_{y,o}  Σ_{t∈U} Σ_{k∈K'} n_{t,k} · Δ
+            s.t. same shift, cap, and one-shift-per-operator constraints (Section 4.2)
+                 restricted to t ∈ U, k ∈ K'
 ```
 
 ```
@@ -617,42 +626,99 @@ If baseline cost is `C^{base}`:
 
 ## 9) Demo plan (engineering real, end-to-end)
 
-### 9.1 Inputs (one day)
-- 2-4 weeks of real inquiry logs per store: timestamps, type k, service time.
-- Operator roster constraints and wage tables.
-- Leader span-of-control policy.
-- SLA targets for RT/IT.
-- Pinned parameters: `Δ`, `w_k^{max}`, `ε_k`, `ε^{dem}_{t,k}`.
-- Last `D` days of handle-time logs per type `k` → compute `μ_k` via measurement procedure (Section 3.0.3).
-- Forecast contract: quantile `d_{t,k}` with calibration report.
-- Shift template set `S` (labor-law compliant).
-- Wages `w_k`, `w_k^{OT}`, `w_L`, leader span `η`.
-- Headcount caps `H^{cap}_k` (required). Overtime/leader caps if applicable.
+### 9.1 Raw data required (from operations)
+
+This is the actual data the demo needs. Everything else is computed from it.
+
+**A. Inquiry logs** (minimum 4 weeks per store, 8+ weeks is better for forecast calibration):
+
+| Field | Description |
+|---|---|
+| `inquiry_id` | Unique identifier per inquiry (for deduplication and tracing) |
+| `timestamp` | When the inquiry arrived, with timezone (second-level or better) |
+| `type_k` | Inquiry type / skill pool — however operators are currently segmented (language, store zone, inquiry family, region — see Section 3.0.2) |
+| `store_id` | Which store |
+| `first_pickup_timestamp` | When an operator first picked up the inquiry |
+| `final_resolution_timestamp` | When the inquiry was resolved — handle time is `final_resolution - first_pickup`, needed for `μ_k` measurement (Section 3.0.3) |
+| `wait_time` | Time from arrival to first pickup (optional — can be derived from `timestamp` and `first_pickup_timestamp`, useful for baseline RT reporting) |
+| `operator_id` | Operator who handled the inquiry, anonymized is fine (optional — useful for verifying dedicated-pool and one-shift-per-operator assumptions) |
+| `reassignment` | Whether the inquiry was handed off between operators (optional — if reassignments happen, affects how handle time is measured for `μ_k`) |
+
+**B. Operator and leader data:**
+
+| Field | Description |
+|---|---|
+| Operator roster | List of operators, their skill type `k`, availability per day |
+| Headcount cap `H^{cap}_k` | Maximum number of type-k operators available for rostering (required — Section 4.2) |
+| Hourly wage `w_k` | Regular wage per skill type |
+| OT wage `w^{OT}_k` | Overtime wage per skill type |
+| Leader wage `w_L` | Hourly leader wage |
+| Span-of-control `η` | How many operators per leader (e.g., 1 leader per 10 operators → `η = 0.1`) |
+| Leader cap `L^{cap}_t` | Max leaders per bucket (optional) |
+| Overtime cap `o^{cap}_{t,k}` | Max OT operators per bucket/type (optional) |
+
+**C. Shift templates:**
+
+| Field | Description |
+|---|---|
+| Shift set `S` | All allowed shift templates: start time, duration, break placement |
+| One-shift-per-operator rule | Confirm: each operator works at most one shift per day (Section 4.2) |
+| Any additional labor-law constraints | Max hours/week, minimum rest between shifts, etc. — encoded as restrictions on which `s ∈ S` exist or as linear constraints on `y` |
+
+**D. SLA parameters (jointly decided or from current policy):**
+
+| Parameter | Description |
+|---|---|
+| Bucket size `Δ` | Planning time granularity (e.g., 15 min or 1 hr) |
+| Max wait `w_k^{max}` | RT SLA threshold per type (e.g., 60 seconds) |
+| Tail probability `ε_k` | Allowed fraction exceeding `w_k^{max}` (e.g., 0.05 for p95) |
+| Demand confidence `ε^{dem}_{t,k}` | Forecast quantile level (e.g., 0.05 for 95th percentile demand) |
+
+**E. Baseline for comparison:**
+
+| Field | Description |
+|---|---|
+| Current cost `C^{base}` | What operations currently costs per day/store (for savings comparison) |
+| Current schedule | How shifts are currently assigned (optional — for side-by-side comparison) |
 
 ### 9.2 Build
 
-**Step A: Precompute `N_req(λ; k)`**
-- For each `k`, tabulate `N_req` over a grid of `λ` values using the pinned SLA physics (Section 3.0.1).
-- Store the table and hash it (this is part of the contract).
+**Step A: Measure `μ_k` from handle-time logs**
+- For each type `k`, collect handle times from the last `D` days (e.g., `D = 14`).
+- Winsorize at `[p05, p95]`, take median → `μ_k = 1/median` (Section 3.0.3).
+- Hash the raw samples and winsorization rule for reproducibility.
 
-**Step B: Solve planning MILP**
-- Calibrate forecast contract `d_{t,k}` (quantiles) and verify coverage (`≥ 1 - ε^{dem}_{t,k}` on held-out days).
-- Solve for each day: output `C*` and canonical plan `(y*, o*, L*)` via tie-break chain.
-- Emit optimality gap certificate (MILP bound).
-- Output UNIQUE-PLAN/UNSAT/Ω + receipts.
+**Step B: Build forecast contract `d_{t,k}`**
+- From inquiry logs, fit quantile forecasts per (t, k) at level `1 - ε^{dem}_{t,k}`.
+- Calibration check on held-out days: empirical coverage ≥ `1 - ε^{dem}_{t,k}`.
+- If calibration fails, apply deterministic fallback (Section 2): `d^{fallback}_{t,k} = max(d^{model}_{t,k}, Q^{emp}_{1-ε}(A_{t,k}))`.
 
-**Step C: Replay real-time**
-- Replay historical arrival traces `A_{t,k}`, run minimal overtime recourse using `N_req`.
-- Choose OT and dispatch.
-- Report RT SLA pass rate and overtime used.
+**Step C: Precompute `N_req(λ; k)` table**
+- For each `k`, tabulate over grid: `λ ∈ [0, H^{cap}_k · μ_k · ρ^{max}]` with step `Δλ_k` (Section 3.1.2).
+- Conservative interpolation: round up to next grid point.
+- Store the table and hash it.
 
-**Step D: Compare to baseline**
-- Cost, RT tails, idle, OT, leader hours.
+**Step D: Solve planning MILP**
+- For each demo day: solve `C* = min_{y,L}` subject to `N_req` coverage, caps, one-shift-per-operator, leader ceiling (Section 4).
+- Apply tie-break chain `(J_1, J_2, J_3, lex-hash)` for UNIQUE-PLAN.
+- Emit optimality gap certificate.
+- Output UNIQUE-PLAN / UNSAT (with IIS + deficit δ) / Ω.
+
+**Step E: Replay real-time**
+- Replay actual arrival traces `A_{t,k}` against the planned roster.
+- At each bucket, compute `λ̂_{t,k} = (A_{t,k} + Q_{t,k}) / Δ` and add minimal OT to maintain `N_req` (Section 5.3).
+- Report RT SLA pass rate and overtime cost `C_OT`.
+
+**Step F: Compare to baseline**
+- `ΔC = C^{base} - C*` (savings from planning alone).
+- RT tail compliance: planned vs current.
+- Idle hours, overtime hours, leader hours.
 
 ### 9.3 Outputs
-- Day-ahead cost `C*` vs current benchmark.
+
+- Day-ahead cost `C*` vs current benchmark `C^{base}`.
 - Real-time OT cost `C_OT` (from replay, reported separately).
-- Canonical plan with tie-break receipts `(J_1, J_2, J_3, J_4)`.
+- Canonical plan with tie-break receipts `(J_1, J_2, J_3)`.
 - RT compliance (tail bound satisfied by construction via `N_req`).
 - Idle hours (tie-break metric, not a tunable weight).
 - UNSAT days: deficit witness `δ(U, K')` + IIS artifact.
