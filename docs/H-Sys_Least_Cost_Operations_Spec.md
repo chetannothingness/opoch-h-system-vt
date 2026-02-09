@@ -14,12 +14,13 @@ H-Sys is a stochastic service system with:
 - legal shift constraints,
 - overtime recourse.
 
-The "least cost" is not benchmark-relative. It is the optimum of a pinned contract:
+The "least cost" is not benchmark-relative. It is the optimum of a day-ahead planning problem given fixed headcount caps and pinned SLA physics:
 
 ```
-C* = min_{legal staffing + real-time recourse}
-     E[Operator wages + Leader wages + OT wages + SLA penalties]
+C* = min_{legal staffing}  [Operator wages + Leader wages]
 ```
+
+Real-time overtime recourse is a separate execution report (Section 5), not part of `C*`.
 
 If infeasible: output **UNSAT** with a minimal deficit witness.
 
@@ -56,8 +57,8 @@ Contract choice: We promise **UNIQUE-PLAN** in the demo, not just UNIQUE-COST.
 - Leader wage `w_L`.
 - Optional: hiring, training, attrition costs for long-term.
 
-**Caps (if applicable)**
-- Headcount cap `H^{cap}_k` per skill type (optional).
+**Caps**
+- Headcount cap `H^{cap}_k` per skill type (required for daily planning; hiring decisions are a separate outer-loop problem).
 - Overtime cap `o^{cap}_{t,k}` per bucket/type (optional).
 - Leader cap `L^{cap}_t` per bucket (optional).
 
@@ -106,7 +107,7 @@ The operational cost (operators + leaders + OT) is:
 
 Forecast output must be a **witnessable constraint object** that planning can satisfy.
 
-Two acceptable contracts are defined below. We use the **quantile contract (Section 2.1)**. The intensity interval contract (Section 2.2) is an alternative documented for reference.
+We use the **quantile contract (Section 2.1)**. The intensity interval contract (Section 2.2) is an alternative documented for reference but not used.
 
 ### 2.1 Quantile (service guarantee) contract
 
@@ -136,7 +137,19 @@ If used, `λ_{t,k}^{rob} := λ̄_{t,k}`.
 - Calibration check: empirical coverage on held-out days ≥ `1 - ε^{dem}_{t,k}`.
 - Plus hashes of dataset/model.
 
-If calibration fails: output **Ω** ("forecast contract not satisfied").
+**Forecast failure fallback (deterministic):**
+
+If calibration fails, the pipeline does **not** output Ω and stop. Instead, it replaces the model forecast with a conservative empirical fallback:
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│  d^{fallback}_{t,k} := max( d^{model}_{t,k},  Q^{emp}_{1-ε}(A_{t,k}) ) │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+where `Q^{emp}_{1-ε}(A_{t,k})` is the empirical quantile from the last `D` days of actual arrival logs (same `D` and winsorization rule as the `μ_k` procedure, Section 3.0.3).
+
+Planning then proceeds with `λ_{t,k}^{rob} := d^{fallback}_{t,k} / Δ`. This makes the demand contract more conservative (possibly increasing staffing cost), which is correct. Forecast failure never becomes a way to dodge the least-cost computation.
 
 ---
 
@@ -177,6 +190,17 @@ Monotonicity of `N_req` is a theorem under this model: as `n` increases, waiting
 
 Each operator belongs to exactly one skill type `k` during a bucket. So the per-k queue model is correct and `N_req(λ; k)` is separable per type.
 
+**Operational mapping of `k`:** `k` corresponds to the actual workforce segmentation used in current planning. Typical definitions:
+
+| `k` | Example |
+|---|---|
+| Language pool | English, Spanish, Japanese operators |
+| Store zone pool | Fresh, Electronics, General Merchandise |
+| Inquiry family | Product identification, checkout review, theft review |
+| Region/compliance pool | US, EU, JP (different labor rules) |
+
+If planning already staffs these pools separately — even if dispatch later does minor cross-skill routing — then the dedicated-pool model is the correct abstraction of how staffing decisions are actually made.
+
 If multi-skill pooling is introduced, the per-k model generalizes as follows. Let pools be `p ∈ P`, each pool serves a set of types `K(p)`. Let effective arrivals:
 
 ```
@@ -190,6 +214,24 @@ n_{t,p} ≥ N_req(λ_{t,p}^{rob}; p)
 ```
 
 plus routing constraints as a bipartite flow each bucket.
+
+#### 3.0.3 Service rate measurement procedure
+
+`μ_k` is not a tunable parameter — it is a deterministic function of historical logs. This matters because `N_req` depends on `μ_k`; if `μ_k` is unstable, so is feasibility.
+
+For each type `k`, collect handle times `h_i` over the last `D` days (e.g., `D = 14`):
+
+1. Winsorize at `[p05, p95]` to remove outliers.
+2. Take the median handle time `m_k`.
+3. Define:
+
+```
+┌──────────────────────┐
+│  μ_k = 1 / m_k      │
+└──────────────────────┘
+```
+
+**Verifier:** the `μ_k` bundle includes hashes of the raw handle-time samples and the winsorization rule.
 
 ### 3.1 RT (resolution time) via queue physics
 
@@ -322,9 +364,9 @@ n_{t,k} ≥ N_req(λ_{t,k}^{rob}; k)    ∀ t, k
 L_t ≥ η · Σ_k n_{t,k}
 ```
 
-**Caps (if pinned):**
+**Caps:**
 ```
-Σ_s y_{s,k} ≤ H^{cap}_k             (headcount cap per skill, if applicable)
+Σ_s y_{s,k} ≤ H^{cap}_k             (headcount cap per skill, required)
 o_{t,k} ≤ o^{cap}_{t,k}             (overtime cap per bucket/type, if applicable)
 L_t ≤ L^{cap}_t                      (leader cap per bucket, if applicable)
 ```
@@ -347,13 +389,16 @@ Any skill eligibility constraints apply as further linear restrictions.
 
 ### 4.4 Objective (pinned, no penalties) and canonical plan selection
 
-**Stage 1 (least cost):**
+**Stage 1 (least cost, day-ahead with no planned overtime):**
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  C* = min_{y,o,L}  C(y,o,L)   s.t. all constraints above   │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  C* = min_{y,L}  Σ_{s,k} w_k · y_{s,k} · hours(s) + Σ_t w_L · L_t · Δ│
+│       s.t. all constraints above, o_{t,k} = 0  ∀ t, k                   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
+
+The roster is built to satisfy `N_req` via shift staffing alone, without pre-planned overtime. Overtime arises only in real-time recourse (Section 5) when realized demand deviates from forecast.
 
 **Stages 2–6 (canonical tie-break chain for UNIQUE-PLAN):**
 
@@ -399,7 +444,7 @@ This is **NP-hard** because shift selection is a form of set cover with integer 
 
 ## 5) Real-time optimizer (solves part c) — recourse minimization
 
-Planning is done ahead of time; real arrivals `A_{t,k}` differ. Real-time must minimize OT, given current state.
+Planning is done ahead of time; real arrivals `A_{t,k}` differ. The real-time optimizer is a separate execution stage — its OT cost is not part of the day-ahead `C*` but is reported alongside it for full transparency.
 
 ### 5.1 Backlog dynamics (ledger state)
 
@@ -408,9 +453,9 @@ Q_{t+1,k} = max{0, Q_{t,k} + A_{t,k} - S_{t,k}},    S_{t,k} ≤ μ_k · n_{t,k} 
 ```
 
 ### 5.2 Real-time controls
-- dispatch/routing of multi-skill operators across queues,
+- dispatch within each pool `k` (cross-skill routing across pools is described in the pooling extension, Section 3.0.2),
 - overtime requests `o_{t,k}`,
-- optional: priority rules.
+- optional: priority rules within each pool.
 
 ### 5.3 Recourse in the same contract normal form (N_req)
 
@@ -434,33 +479,48 @@ If infeasible (caps), output **UNSAT** with the same deficit witness (Section 7)
 
 ---
 
-## 6) The unified least-cost definition (planning + real-time)
+## 6) The unified least-cost definition
 
-The complete least cost to run H-Sys is:
+### 6.1 C* is the day-ahead planning MILP
+
+`C*` is the optimum of the day-ahead planning MILP (Section 4):
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│  C* = min_{y,L} [ Σ_{s,k} w_k · y_{s,k} · hours(s)                       │
-│                  + Σ_t w_L · L_t · Δ                                       │
-│                  + E_A  min_{o(·), dispatch(·)}  Φ(y,L; A,o,dispatch) ]    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  C* = min_{y,L}  Σ_{s,k} w_k · y_{s,k} · hours(s)                    │
+│                + Σ_t     w_L · L_t · Δ                                 │
+│       s.t. all constraints (Section 4.2), o_{t,k} = 0                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-`Φ` includes overtime costs as defined above.
+The roster is built to satisfy `N_req` under forecast demand, without pre-planned overtime.
 
-**This is the exact end-to-end mathematical object for "least cost".**
+### 6.2 Real-time OT is a separate execution report
+
+The real-time optimizer (Section 5) adds minimal overtime when actual arrivals exceed the forecast contract. The full cost picture for a given day is:
+
+```
+C_total = C* (day-ahead roster cost)  +  C_OT (real-time overtime cost)
+```
+
+`C_OT` is observable only after replay or live execution. It is not embedded in the planning objective.
+
+### 6.3 Closure
 
 Under the pinned contract (Section 3.0), all structural gaps are closed:
 
 1. **RT constraint is computable:** it is a precomputed monotone staffing curve `N_req` and a linear constraint `n ≥ N_req`, under a declared M/M/n physics model (Section 3.0.1). No nonlinear constraints remain in the optimizer.
 2. **UNSAT witness matches feasibility:** infeasibility is about failing `n ≥ N_req`, and IIS/deficits certify exactly that (Section 7). The witness is keyed to the same `N_req` the optimizer enforces.
 3. **Least cost is unambiguous:** single cost objective `C*`, plus a canonical tie-break chain (Section 4.4) that selects a single deterministic plan (**UNIQUE-PLAN**). No penalty weights, no mode selection.
-4. **Demand contract is pinned:** quantile contract only, so `λ^{rob}` is unambiguous.
-5. **Skill model is scoped:** dedicated pools per type `k`, so per-k `N_req` is correct.
+4. **Demand contract is chosen:** quantile contract, so `λ^{rob}` is unambiguous.
+5. **Skill model:** dedicated pools per type `k`, so per-k `N_req` is correct.
+6. **Service rate `μ_k`:** deterministic measurement procedure (Section 3.0.3), so `N_req` is stable and reproducible.
+7. **Headcount caps `H^{cap}_k`:** required, so UNSAT is meaningful. Hiring is a separate outer-loop problem.
+8. **Forecast failure has a deterministic fallback** (Section 2): conservative empirical quantile replaces the model forecast. The pipeline never dodges the computation via Ω.
 
-**This is the full closure: one contract → one computable optimization → one canonical plan → one matching witness system.**
+**One contract → one computable MILP → one canonical plan → one matching witness system.**
 
 ---
 
@@ -468,8 +528,8 @@ Under the pinned contract (Section 3.0), all structural gaps are closed:
 
 For any given instance (store/day), output only:
 
-### UNIQUE-PLAN
-- Canonical schedule `y*_{s,k}`, leaders `L*_t`, overtime `o*_{t,k}`, dispatch.
+### UNIQUE-PLAN (only when MILP optimality gap ≤ tolerance)
+- Canonical schedule `y*_{s,k}`, leaders `L*_t`.
 - Total cost `C*`.
 - Tie-break receipts: values of `(J_1, J_2, J_3, J_4)` from the canonical chain (Section 4.4).
 - Computed RT/IT per bucket.
@@ -480,53 +540,26 @@ For any given instance (store/day), output only:
 
 Because the RT SLA is now exactly the linear requirement `n_{t,k} ≥ N_req(λ_{t,k}^{rob}; k)`, infeasibility can be certified by a standard IIS (irreducible infeasible subset) from the MILP.
 
-Two artifacts are produced:
-1. **IIS from MILP solver** (machine-readable).
-2. **Human-readable deficit witness** in windows/types (below).
+The witness is produced in two steps:
 
-#### 7.1 Formal definition of maximum possible coverage
+1. **IIS from MILP solver** (machine-readable, machine-minimal infeasible constraint set).
+2. **Human-readable deficit witness** derived by projecting the IIS to buckets/types (below).
 
-Given shift templates `S`, headcount caps `H^{cap}_k` (if applicable), and overtime caps `o^{cap}_{t,k}` (if applicable):
+The human-readable witness is derived from the IIS — it is not an independently computed globally minimal window.
 
-```
-n^{max}_{t,k} = max{ Σ_s y_{s,k} · 1[t ∈ cov(s)] : Σ_s y_{s,k} ≤ H^{cap}_k,
-                      y_{s,k} ∈ Z≥0 }  +  o^{cap}_{t,k}
-```
+#### 7.1 Deriving the human-readable witness from IIS
 
-If no headcount cap: `n^{max}_{t,k}` is derived from feasible shift start times and legal constraints on staffing ramp (if any).
+The MILP solver produces an IIS: a minimal set of constraints that are jointly infeasible. Project the IIS constraints involving RT coverage (`n_{t,k} ≥ N_req`) onto their bucket/type indices to obtain a window `U ⊆ T` and type set `K' ⊆ K`.
 
-If leaders are capped (`L^{cap}_t`), leader feasibility can create additional infeasibility:
-```
-L^{cap}_t < η · Σ_k n_{t,k}   →   effective cap on total staffing in bucket t
-```
-
-#### 7.2 Simple human-readable witness
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  ∃ (t,k):  n^{max}_{t,k}  <  N_req(λ_{t,k}^{rob}; k)                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-where `n^{max}_{t,k}` is formally defined above.
-
-#### 7.3 Cut-style witness (staffing-hours form, keyed to the same RT-normal form)
-
-The minimal infeasibility can be witnessed by any window `U ⊆ T` and type set `K' ⊆ K` where:
-
-Let required staffing-hours be:
+Then report the deficit over that window:
 
 ```
 D(U, K') = Σ_{t∈U} Σ_{k∈K'} N_req(λ_{t,k}^{rob}; k) · Δ
 ```
 
-Let maximum schedulable staffing-hours be:
-
 ```
-S(U, K') = Σ_{t∈U} Σ_{k∈K'} n^{max}_{t,k} · Δ
+S(U, K') = maximum schedulable staffing-hours in the window given caps and templates
 ```
-
-Deficit:
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -536,13 +569,14 @@ Deficit:
 
 Interpretation: "You are short by δ operator-slots over this time window for these queues, even at maximum feasible staffing."
 
-`U, K'` can be computed as the smallest IIS-projected window (take the IIS constraints involving RT coverage and aggregate them).
+If leaders are capped (`L^{cap}_t`), leader feasibility can create additional infeasibility — the IIS will include the leader constraint and the witness will reflect it.
 
 **This certifies infeasibility for the same RT constraint the optimizer enforces.**
 
-### Ω
-- best feasible cost, best lower bound, exact gap,
-- what additional compute/capacity would close it.
+### Ω (solver budget-limited, optimality not proven)
+- Best feasible cost (upper bound), best lower bound, exact gap.
+- The canonical incumbent plan (same tie-break chain applies to the best known feasible solution).
+- What additional compute/capacity would close the gap.
 
 ---
 
@@ -588,11 +622,12 @@ If baseline cost is `C^{base}`:
 - Operator roster constraints and wage tables.
 - Leader span-of-control policy.
 - SLA targets for RT/IT.
-- Pinned parameters: `Δ`, `μ_k`, `w_k^{max}`, `ε_k`, `ε^{dem}_{t,k}`.
+- Pinned parameters: `Δ`, `w_k^{max}`, `ε_k`, `ε^{dem}_{t,k}`.
+- Last `D` days of handle-time logs per type `k` → compute `μ_k` via measurement procedure (Section 3.0.3).
 - Forecast contract: quantile `d_{t,k}` with calibration report.
 - Shift template set `S` (labor-law compliant).
 - Wages `w_k`, `w_k^{OT}`, `w_L`, leader span `η`.
-- Caps: `H^{cap}_k`, `o^{cap}_{t,k}`, `L^{cap}_t` (if applicable).
+- Headcount caps `H^{cap}_k` (required). Overtime/leader caps if applicable.
 
 ### 9.2 Build
 
@@ -615,7 +650,8 @@ If baseline cost is `C^{base}`:
 - Cost, RT tails, idle, OT, leader hours.
 
 ### 9.3 Outputs
-- Cost `C*` vs current benchmark.
+- Day-ahead cost `C*` vs current benchmark.
+- Real-time OT cost `C_OT` (from replay, reported separately).
 - Canonical plan with tie-break receipts `(J_1, J_2, J_3, J_4)`.
 - RT compliance (tail bound satisfied by construction via `N_req`).
 - Idle hours (tie-break metric, not a tunable weight).
